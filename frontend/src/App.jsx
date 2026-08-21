@@ -1,51 +1,422 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
+import CameraPanel from "./components/CameraPanel";
+import ResultPanel from "./components/ResultPanel";
+
+const WS_URL = "ws://127.0.0.1:8000/ws/wagon-detection";
+
 function App() {
   const videoRef = useRef(null);
+  const canvasRef = useRef(null);
   const streamRef = useRef(null);
+  const websocketRef = useRef(null);
+
+  const scanningRef = useRef(false);
+  const processingRef = useRef(false);
+  const nextFrameTimeoutRef = useRef(null);
 
   const [cameraActive, setCameraActive] = useState(false);
+  const [websocketConnected, setWebsocketConnected] =
+    useState(false);
+
+  const [detectionResult, setDetectionResult] =
+    useState(null);
+
+  const [resultVisible, setResultVisible] =
+    useState(false);
+
   const [error, setError] = useState("");
+  const [scanning, setScanning] = useState(false);
+
+  /*
+   * Connect WebSocket
+   */
+
+  const connectWebSocket = () => {
+    return new Promise((resolve, reject) => {
+      const websocket = new WebSocket(WS_URL);
+
+      websocketRef.current = websocket;
+
+      websocket.onopen = () => {
+        console.log("WebSocket connected");
+
+        setWebsocketConnected(true);
+
+        resolve(websocket);
+      };
+
+      websocket.onmessage = (event) => {
+        processingRef.current = false;
+
+        try {
+          const data = JSON.parse(event.data);
+
+          console.log(
+            "Backend response:",
+            data
+          );
+
+          if (data.type === "wagon_detected") {
+            const wagonNumber =
+              data?.ocr?.wagon_number;
+
+            const validation =
+              data?.validation;
+
+            const isValid =
+              validation?.valid === true;
+
+            /*
+             * Successful scan
+             */
+
+            if (
+              isValid &&
+              wagonNumber &&
+              wagonNumber.length === 11
+            ) {
+              console.log(
+                "Wagon verified:",
+                wagonNumber
+              );
+
+              setDetectionResult(data);
+              setResultVisible(true);
+
+              scanningRef.current = false;
+              processingRef.current = false;
+
+              setScanning(false);
+
+              stopCamera();
+
+              return;
+            }
+
+            /*
+             * OCR result but not yet valid
+             */
+
+            setDetectionResult(data);
+          }
+
+          /*
+           * No detection
+           */
+
+          if (data.type === "no_detection") {
+            // Continue scanning.
+          }
+
+          /*
+           * Backend error
+           */
+
+          if (data.type === "error") {
+            console.error(
+              "Backend error:",
+              data.message
+            );
+
+            setError(
+              data.message ||
+                "Detection failed."
+            );
+          }
+
+          /*
+           * Send next frame
+           */
+
+          if (scanningRef.current) {
+            scheduleNextFrame();
+          }
+        } catch (err) {
+          console.error(
+            "Unable to parse backend response:",
+            err
+          );
+
+          processingRef.current = false;
+
+          if (scanningRef.current) {
+            scheduleNextFrame();
+          }
+        }
+      };
+
+      websocket.onerror = (event) => {
+        console.error(
+          "WebSocket error:",
+          event
+        );
+
+        processingRef.current = false;
+
+        setWebsocketConnected(false);
+
+        setError(
+          "Unable to connect to the wagon detection backend."
+        );
+
+        reject(
+          new Error(
+            "Unable to connect to the wagon detection backend."
+          )
+        );
+      };
+
+      websocket.onclose = () => {
+        console.log(
+          "WebSocket disconnected"
+        );
+
+        setWebsocketConnected(false);
+
+        processingRef.current = false;
+      };
+    });
+  };
+
+  /*
+   * Schedule next frame
+   */
+
+  const scheduleNextFrame = () => {
+    if (!scanningRef.current) {
+      return;
+    }
+
+    if (nextFrameTimeoutRef.current) {
+      clearTimeout(
+        nextFrameTimeoutRef.current
+      );
+    }
+
+    nextFrameTimeoutRef.current =
+      setTimeout(() => {
+        sendFrame();
+      }, 100);
+  };
+
+  /*
+   * Send camera frame
+   */
+
+  const sendFrame = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const websocket =
+      websocketRef.current;
+
+    if (!scanningRef.current) {
+      return;
+    }
+
+    if (!video || !canvas || !websocket) {
+      return;
+    }
+
+    if (
+      websocket.readyState !==
+      WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    if (
+      video.videoWidth === 0 ||
+      video.videoHeight === 0
+    ) {
+      scheduleNextFrame();
+      return;
+    }
+
+    if (processingRef.current) {
+      return;
+    }
+
+    processingRef.current = true;
+
+    canvas.width = 640;
+    canvas.height = 480;
+
+    const context =
+      canvas.getContext("2d");
+
+    if (!context) {
+      processingRef.current = false;
+
+      scheduleNextFrame();
+
+      return;
+    }
+
+    context.drawImage(
+      video,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    const imageData =
+      canvas.toDataURL(
+        "image/jpeg",
+        0.65
+      );
+
+    try {
+      websocket.send(imageData);
+
+      console.log(
+        "Camera frame sent"
+      );
+    } catch (err) {
+      console.error(
+        "Unable to send frame:",
+        err
+      );
+
+      processingRef.current = false;
+    }
+  };
+
+  /*
+   * Start camera
+   */
 
   const startCamera = async () => {
     try {
       setError("");
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "environment",
-          width: {
-            ideal: 1280,
-          },
-          height: {
-            ideal: 720,
-          },
-        },
-        audio: false,
-      });
+      setResultVisible(false);
+      setDetectionResult(null);
+
+      scanningRef.current = false;
+      processingRef.current = false;
+
+      await connectWebSocket();
+
+      const stream =
+        await navigator.mediaDevices.getUserMedia(
+          {
+            video: {
+              facingMode: "environment",
+
+              width: {
+                ideal: 1280,
+              },
+
+              height: {
+                ideal: 720,
+              },
+            },
+
+            audio: false,
+          }
+        );
 
       streamRef.current = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
+      if (!videoRef.current) {
+        throw new Error(
+          "Camera element is unavailable."
+        );
       }
 
-      setCameraActive(true);
+      videoRef.current.srcObject =
+        stream;
+
+      videoRef.current.onloadedmetadata =
+        async () => {
+          try {
+            await videoRef.current.play();
+
+            console.log(
+              "Camera started:",
+              videoRef.current.videoWidth,
+              "x",
+              videoRef.current.videoHeight
+            );
+
+            setCameraActive(true);
+            setScanning(true);
+
+            scanningRef.current = true;
+            processingRef.current = false;
+
+            sendFrame();
+          } catch (err) {
+            console.error(
+              "Unable to start video:",
+              err
+            );
+
+            setError(
+              "Unable to start camera video."
+            );
+          }
+        };
     } catch (err) {
-      console.error("Camera error:", err);
+      console.error(
+        "Camera/WebSocket error:",
+        err
+      );
 
       setError(
-        "Unable to access the camera. Please allow camera permission and try again."
+        err.message ||
+          "Unable to start camera."
       );
+
+      scanningRef.current = false;
+      processingRef.current = false;
+
+      setScanning(false);
+      setCameraActive(false);
+      setWebsocketConnected(false);
+
+      cleanupCamera();
+      cleanupWebSocket();
     }
   };
 
+  /*
+   * Stop camera
+   */
+
   const stopCamera = () => {
+    scanningRef.current = false;
+    processingRef.current = false;
+
+    setScanning(false);
+    setCameraActive(false);
+
+    if (nextFrameTimeoutRef.current) {
+      clearTimeout(
+        nextFrameTimeoutRef.current
+      );
+
+      nextFrameTimeoutRef.current = null;
+    }
+
+    cleanupCamera();
+    cleanupWebSocket();
+  };
+
+  /*
+   * Camera cleanup
+   */
+
+  const cleanupCamera = () => {
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => {
-        track.stop();
-      });
+      streamRef.current
+        .getTracks()
+        .forEach((track) => {
+          track.stop();
+        });
 
       streamRef.current = null;
     }
@@ -53,133 +424,137 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-
-    setCameraActive(false);
   };
+
+  /*
+   * WebSocket cleanup
+   */
+
+  const cleanupWebSocket = () => {
+    if (websocketRef.current) {
+      websocketRef.current.close();
+
+      websocketRef.current = null;
+    }
+
+    setWebsocketConnected(false);
+  };
+
+  /*
+   * Close result
+   */
+
+  const closeResult = () => {
+    setResultVisible(false);
+    setDetectionResult(null);
+  };
+
+  /*
+   * Scan another wagon
+   */
+
+  const scanAnotherWagon = async () => {
+    closeResult();
+
+    stopCamera(false);
+
+    setTimeout(() => {
+      startCamera();
+    }, 100);
+  };
+
+  /*
+   * Component cleanup
+   */
 
   useEffect(() => {
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => {
-          track.stop();
-        });
+      scanningRef.current = false;
+      processingRef.current = false;
+
+      if (
+        nextFrameTimeoutRef.current
+      ) {
+        clearTimeout(
+          nextFrameTimeoutRef.current
+        );
       }
+
+      cleanupCamera();
+      cleanupWebSocket();
     };
   }, []);
 
   return (
     <div className="app">
+
       <header className="header">
+
         <div>
-          <h1>Indian Railway Wagon Detection</h1>
-          <p>Live Wagon Number Recognition System</p>
+          <h1>
+            Indian Railway Wagon Detection
+          </h1>
+
+          <p>
+            Live Wagon Number Recognition System
+          </p>
         </div>
 
         <div
           className={`camera-status ${
-            cameraActive ? "active" : "inactive"
+            cameraActive
+              ? "active"
+              : "inactive"
           }`}
         >
           <span className="status-dot"></span>
 
-          {cameraActive ? "Camera Active" : "Camera Inactive"}
+          {cameraActive
+            ? "Camera Active"
+            : "Camera Inactive"}
         </div>
+
       </header>
 
       <main className="main-container">
-        <section className="camera-card">
-          <div className="camera-header">
-            <div>
-              <h2>Live Camera</h2>
 
-              <p>
-                Position the wagon number inside the detection area.
-              </p>
-            </div>
-          </div>
+        <CameraPanel
+          videoRef={videoRef}
+          canvasRef={canvasRef}
+          cameraActive={cameraActive}
+          websocketConnected={
+            websocketConnected
+          }
+          scanning={scanning}
+          error={error}
+          startCamera={startCamera}
+          stopCamera={() => {
+            stopCamera();
+            setDetectionResult(null);
+            setResultVisible(false);
+          }}
+          isVerified={
+            resultVisible &&
+            detectionResult?.validation
+              ?.valid === true
+          }
+        />
 
-          <div className="camera-container">
-            {!cameraActive && (
-              <div className="camera-placeholder">
-                <div className="camera-icon">📷</div>
+        <ResultPanel
+          detectionResult={detectionResult}
+          onClose={() => {
+            setDetectionResult(null);
+            setResultVisible(false);
+          }}
+          onScanAgain={() => {
+            setDetectionResult(null);
+            setResultVisible(false);
+            startCamera();
+          }}
+        />
 
-                <h3>Camera is not active</h3>
-
-                <p>
-                  Start the camera to begin wagon number detection.
-                </p>
-
-                <button
-                  className="start-button"
-                  onClick={startCamera}
-                >
-                  Start Camera
-                </button>
-              </div>
-            )}
-
-            <video
-              ref={videoRef}
-              className={`camera-video ${
-                cameraActive ? "visible" : "hidden"
-              }`}
-              autoPlay
-              playsInline
-              muted
-            />
-
-            {cameraActive && (
-              <>
-                <div className="detection-box">
-                  <div className="corner top-left"></div>
-                  <div className="corner top-right"></div>
-                  <div className="corner bottom-left"></div>
-                  <div className="corner bottom-right"></div>
-
-                  <span className="detection-label">
-                    Position Wagon Number Here
-                  </span>
-                </div>
-
-                <div className="camera-overlay">
-                  <span>LIVE</span>
-                </div>
-              </>
-            )}
-          </div>
-
-          {error && (
-            <div className="error-message">
-              {error}
-            </div>
-          )}
-
-          {cameraActive && (
-            <div className="camera-actions">
-              <button
-                className="stop-button"
-                onClick={stopCamera}
-              >
-                Stop Camera
-              </button>
-            </div>
-          )}
-        </section>
-
-        <section className="result-card">
-          <h2>Detection Result</h2>
-
-          <div className="result-placeholder">
-            <div className="result-icon">🔍</div>
-
-            <h3>Waiting for wagon detection</h3>
-
-            <p>
-              YOLO and PaddleOCR will appear here in the next stage.
-            </p>
-          </div>
-        </section>
       </main>
+
     </div>
   );
 }
