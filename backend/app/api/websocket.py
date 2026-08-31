@@ -3,11 +3,12 @@ import base64
 import cv2
 import numpy as np
 
-from fastapi import (
-    APIRouter,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import APIRouter
+from fastapi import WebSocket
+from fastapi import WebSocketDisconnect
+
+from app.database.database import get_db
+from app.database.crud import get_railway_record
 
 from app.services.detection_service import (
     detect_wagon_number,
@@ -24,16 +25,63 @@ router = APIRouter()
 async def wagon_detection_websocket(
     websocket: WebSocket,
 ):
-    await websocket.accept()
+    record_id = websocket.query_params.get(
+        "record_id"
+    )
 
-    print("Wagon detection client connected")
+    if not record_id:
+        await websocket.close(
+            code=1008,
+            reason="Railway record ID is required",
+        )
+        return
 
     try:
+        record_id = int(record_id)
+    except ValueError:
+        await websocket.close(
+            code=1008,
+            reason="Invalid railway record ID",
+        )
+        return
+
+    db = next(get_db())
+
+    try:
+        railway_record = get_railway_record(
+            db,
+            record_id,
+        )
+
+        if railway_record is None:
+            await websocket.close(
+                code=1008,
+                reason="Railway record not found",
+            )
+            return
+
+        if railway_record.line_out is not None:
+            await websocket.close(
+                code=1008,
+                reason="Railway inspection already finished",
+            )
+            return
+
+        await websocket.accept()
+
+        print(
+            f"Wagon detection client connected "
+            f"for railway record {record_id}"
+        )
+
         while True:
             frame_data = await websocket.receive_text()
 
             if "," in frame_data:
-                frame_data = frame_data.split(",", 1)[1]
+                frame_data = frame_data.split(
+                    ",",
+                    1,
+                )[1]
 
             try:
                 image_bytes = base64.b64decode(
@@ -72,7 +120,9 @@ async def wagon_detection_websocket(
             height, width = frame.shape[:2]
 
             try:
-                detection = detect_wagon_number(frame)
+                detection = detect_wagon_number(
+                    frame
+                )
 
             except Exception as exc:
                 print(
@@ -151,6 +201,7 @@ async def wagon_detection_websocket(
 
             is_verified = bool(
                 wagon_number
+                and len(str(wagon_number)) == 11
                 and validation
                 and validation.get("valid") is True
                 and metadata is not None
@@ -201,13 +252,6 @@ async def wagon_detection_websocket(
                         else "NOT VERIFIED"
                     ),
                 )
-
-            if is_verified:
-                print("=" * 40)
-                print(
-                    f"WAGON VERIFIED: {wagon_number}"
-                )
-                print("=" * 40)
 
             response = {
                 "success": True,
@@ -283,9 +327,15 @@ async def wagon_detection_websocket(
             )
 
             if is_verified:
+                print("=" * 40)
                 print(
-                    "Stopping current wagon scan..."
+                    f"WAGON VERIFIED: {wagon_number}"
                 )
+                print(
+                    "Returning verified wagon to frontend"
+                )
+                print("=" * 40)
+
                 break
 
     except WebSocketDisconnect:
@@ -300,6 +350,18 @@ async def wagon_detection_websocket(
         )
 
         try:
-            await websocket.close()
+            await websocket.send_json(
+                {
+                    "success": False,
+                    "type": "error",
+                    "message": (
+                        "Wagon detection service "
+                        "encountered an unexpected error."
+                    ),
+                }
+            )
         except Exception:
             pass
+
+    finally:
+        db.close()
